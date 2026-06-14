@@ -1,46 +1,53 @@
-import { Router } from "express";
-import { supabase } from "../server.js";
-import { requireAuth } from "../lib/middleware.js";
+import express          from "express";
+import cors             from "cors";
+import helmet           from "helmet";
+import rateLimit        from "express-rate-limit";
+import { createClient } from "@supabase/supabase-js";
+import { Queue }        from "bullmq";
+import IORedis          from "ioredis";
+import dotenv           from "dotenv";
 
-const router = Router();
-router.use(requireAuth);
+import authRoutes      from "./auth.js";
+import channelRoutes   from "./channels.js";
+import pipelineRoutes  from "./pipeline.js";
+import publishRoutes   from "./publish.js";
+import analyticsRoutes from "./analytics.js";
+import oauthRoutes     from "./oauth.js";
 
-router.get("/", async (req, res) => {
-  const { data, error } = await supabase
-    .from("channels")
-    .select("*, connections(*)")
-    .eq("user_id", req.user.id)
-    .order("created_at", { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+dotenv.config();
+
+export const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+export const redis = new IORedis(process.env.REDIS_URL || "redis://localhost:6379", {
+  maxRetriesPerRequest: null,
 });
 
-router.post("/", async (req, res) => {
-  const { name, handle, tagline, niche, logo } = req.body;
-  if (!name || !niche) return res.status(400).json({ error: "name and niche required" });
-  const { data, error } = await supabase
-    .from("channels")
-    .insert({ user_id: req.user.id, name, handle, tagline, niche, logo })
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+export const pipelineQueue = new Queue("pipeline", { connection: redis });
+export const publishQueue  = new Queue("publish",  { connection: redis });
+
+const app = express();
+
+app.use(helmet());
+app.use(cors({ origin: process.env.FRONTEND_URL || "*", credentials: true }));
+app.use(express.json({ limit: "10mb" }));
+app.use(rateLimit({ windowMs: 60_000, max: 120, standardHeaders: true }));
+
+app.use("/api/auth",      authRoutes);
+app.use("/api/channels",  channelRoutes);
+app.use("/api/pipeline",  pipelineRoutes);
+app.use("/api/publish",   publishRoutes);
+app.use("/api/analytics", analyticsRoutes);
+app.use("/oauth",         oauthRoutes);
+
+app.get("/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
+
+app.use((err, req, res, _next) => {
+  console.error(err);
+  res.status(err.status || 500).json({ error: err.message || "Server error" });
 });
 
-router.get("/:id", async (req, res) => {
-  const { data, error } = await supabase
-    .from("channels")
-    .select("*, connections(*), videos(*)")
-    .eq("id", req.params.id)
-    .eq("user_id", req.user.id)
-    .single();
-  if (error || !data) return res.status(404).json({ error: "Not found" });
-  res.json(data);
-});
-
-router.delete("/:id", async (req, res) => {
-  await supabase.from("channels").delete().eq("id", req.params.id).eq("user_id", req.user.id);
-  res.json({ ok: true });
-});
-
-export default router;
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`ContentOS API on :${PORT}`));
